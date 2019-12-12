@@ -16,9 +16,9 @@ parsed/serialized items using the bincode format.
 """
 
 [dependencies]
-futures = "0.1"
-bytes = "0.4"
-tokio-serde = "0.3"
+futures = "0.3"
+bytes = "0.5"
+tokio-serde = "0.6"
 serde = "1.0"
 bincode = "1.0"
 

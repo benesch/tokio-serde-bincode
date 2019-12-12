@@ -21,11 +21,14 @@ extern crate tokio_serde;
 
 use bincode::Error;
 use bytes::{Bytes, BytesMut};
-use futures::{Poll, Sink, StartSend, Stream};
+use futures::stream::{Stream, TryStream};
+use futures::sink::Sink;
 use serde::{Deserialize, Serialize};
-use tokio_serde::{Deserializer, FramedRead, FramedWrite, Serializer};
+use tokio_serde::{Deserializer, Framed, Serializer};
 
 use std::marker::PhantomData;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 /// Adapts a stream of Bincode encoded buffers to a stream of values by
 /// deserializing them.
@@ -35,7 +38,7 @@ use std::marker::PhantomData;
 /// represents a single Bincode value and does not contain any extra trailing
 /// bytes.
 pub struct ReadBincode<T, U> {
-    inner: FramedRead<T, U, Bincode<U>>,
+    inner: Framed<T, U, (), Bincode<U>>,
 }
 
 /// Adapts a buffer sink to a value sink by serializing the values as Bincode.
@@ -43,8 +46,8 @@ pub struct ReadBincode<T, U> {
 /// `WriteBincode` implements `Sink` by serializing the submitted values to a
 /// buffer. The buffer is then sent to the inner stream, which is responsible
 /// for handling framing on the wire.
-pub struct WriteBincode<T: Sink, U> {
-    inner: FramedWrite<T, U, Bincode<U>>,
+pub struct WriteBincode<T: Sink<Bytes>, U> {
+    inner: Framed<T, (), U, Bincode<U>>,
 }
 
 struct Bincode<T> {
@@ -53,16 +56,15 @@ struct Bincode<T> {
 
 impl<T, U> ReadBincode<T, U>
 where
-    T: Stream,
+    T: TryStream<Ok = BytesMut>,
     T::Error: From<Error>,
     U: for<'de> Deserialize<'de>,
-    BytesMut: From<T::Item>,
 {
     /// Creates a new `ReadBincode` with the given buffer stream.
     pub fn new(inner: T) -> ReadBincode<T, U> {
-        let json = Bincode { ghost: PhantomData };
+        let bincode = Bincode { ghost: PhantomData };
         ReadBincode {
-            inner: FramedRead::new(inner, json),
+            inner: Framed::new(inner, bincode),
         }
     }
 }
@@ -99,55 +101,33 @@ impl<T, U> ReadBincode<T, U> {
 
 impl<T, U> Stream for ReadBincode<T, U>
 where
-    T: Stream,
+    T: TryStream<Ok = BytesMut>,
     T::Error: From<Error>,
     U: for<'de> Deserialize<'de>,
-    BytesMut: From<T::Item>,
 {
-    type Item = U;
-    type Error = <T as Stream>::Error;
+    type Item = Result<U, <T as TryStream>::Error>;
 
-    fn poll(&mut self) -> Poll<Option<U>, Self::Error> {
-        self.inner.poll()
-    }
-}
-
-impl<T, U> Sink for ReadBincode<T, U>
-where
-    T: Sink,
-{
-    type SinkItem = T::SinkItem;
-    type SinkError = T::SinkError;
-
-    fn start_send(&mut self, item: T::SinkItem) -> StartSend<T::SinkItem, T::SinkError> {
-        self.get_mut().start_send(item)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), T::SinkError> {
-        self.get_mut().poll_complete()
-    }
-
-    fn close(&mut self) -> Poll<(), T::SinkError> {
-        self.get_mut().close()
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        unsafe { self.map_unchecked_mut(|x| &mut x.inner) }.poll_next(cx)
     }
 }
 
 impl<T, U> WriteBincode<T, U>
 where
-    T: Sink<SinkItem = Bytes>,
-    T::SinkError: From<Error>,
+    T: Sink<Bytes>,
+    T::Error: From<Error>,
     U: Serialize,
 {
     /// Creates a new `WriteBincode` with the given buffer sink.
     pub fn new(inner: T) -> WriteBincode<T, U> {
         let json = Bincode { ghost: PhantomData };
         WriteBincode {
-            inner: FramedWrite::new(inner, json),
+            inner: Framed::new(inner, json),
         }
     }
 }
 
-impl<T: Sink, U> WriteBincode<T, U> {
+impl<T: Sink<Bytes>, U> WriteBincode<T, U> {
     /// Returns a reference to the underlying sink wrapped by `WriteBincode`.
     ///
     /// Note that care should be taken to not tamper with the underlying sink as
@@ -172,39 +152,34 @@ impl<T: Sink, U> WriteBincode<T, U> {
     pub fn into_inner(self) -> T {
         self.inner.into_inner()
     }
+
+    fn get_pin(self: Pin<&mut Self>) -> Pin<&mut Framed<T, (), U, Bincode<U>>> {
+        unsafe { self.map_unchecked_mut(|x| &mut x.inner) }
+    }
 }
 
-impl<T, U> Sink for WriteBincode<T, U>
+impl<T, U> Sink<U> for WriteBincode<T, U>
 where
-    T: Sink<SinkItem = Bytes>,
-    T::SinkError: From<Error>,
+    T: Sink<Bytes>,
+    T::Error: From<Error>,
     U: Serialize,
 {
-    type SinkItem = U;
-    type SinkError = <T as Sink>::SinkError;
+    type Error = <T as Sink<Bytes>>::Error;
 
-    fn start_send(&mut self, item: U) -> StartSend<U, Self::SinkError> {
-        self.inner.start_send(item)
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.get_pin().poll_ready(cx)
     }
 
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        self.inner.poll_complete()
+    fn start_send(self: Pin<&mut Self>, item: U) -> Result<(), Self::Error> {
+        self.get_pin().start_send(item)
     }
 
-    fn close(&mut self) -> Poll<(), Self::SinkError> {
-        self.inner.poll_complete()
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.get_pin().poll_flush(cx)
     }
-}
 
-impl<T, U> Stream for WriteBincode<T, U>
-where
-    T: Stream + Sink,
-{
-    type Item = T::Item;
-    type Error = T::Error;
-
-    fn poll(&mut self) -> Poll<Option<T::Item>, T::Error> {
-        self.get_mut().poll()
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        self.get_pin().poll_close(cx)
     }
 }
 
@@ -214,7 +189,7 @@ where
 {
     type Error = Error;
 
-    fn deserialize(&mut self, src: &BytesMut) -> Result<T, Error> {
+    fn deserialize(self: Pin<&mut Self>, src: &BytesMut) -> Result<T, Error> {
         bincode::deserialize(src)
     }
 }
@@ -222,7 +197,7 @@ where
 impl<T: Serialize> Serializer<T> for Bincode<T> {
     type Error = Error;
 
-    fn serialize(&mut self, item: &T) -> Result<Bytes, Self::Error> {
+    fn serialize(self: Pin<&mut Self>, item: &T) -> Result<Bytes, Self::Error> {
         bincode::serialize(item).map(Into::into)
     }
 }
